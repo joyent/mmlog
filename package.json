@@ -1,0 +1,26 @@
+{
+	"name": "mmlog",
+	"description": "view chat logs from a Mattermost server",
+	"version": "1.0.0",
+
+	"repository": {
+		"type": "git",
+		"url": "git://github.com/davepacheco/mmlog.git"
+	},
+
+	"bin": {
+		"mmlog": "./bin/mmlog"
+	},
+
+	"dependencies": {
+		"assert-plus": "^1.0.0",
+		"cmdutil": "^1.1.0",
+		"extsprintf": "^1.3.0",
+		"jsprim": "^1.4.1",
+		"posix-getopt": "^1.2.0",
+		"vasync": "^1.6.4",
+		"verror": "^1.10.0"
+	},
+
+	"license": "MIT"
+}

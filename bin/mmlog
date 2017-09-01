@@ -1,0 +1,348 @@
+#!/usr/bin/env node
+/* vim: set ft=javascript: */
+
+/*
+ * mmlog: view mattermost channel log files
+ */
+
+var mod_assertplus = require('assert-plus');
+var mod_cmdutil = require('cmdutil');
+var mod_extsprintf = require('extsprintf');
+var mod_getopt = require('posix-getopt');
+var mod_jsprim = require('jsprim');
+var mod_path = require('path');
+var mod_vasync = require('vasync');
+
+var printf = mod_extsprintf.printf;
+var sprintf = mod_extsprintf.sprintf;
+var VError = require('verror');
+
+var config = require('../lib/config');
+var mattermost = require('../lib/mattermost');
+
+
+/*
+ * Command-line options, as configured using posix-getopt
+ */
+
+var cliOptions = [
+    /* filtering options (see API documentation) */
+    's:(since)'
+];
+
+
+/*
+ * Schemas for objects returned by the Mattermost server.
+ */
+
+var MmSchemaUserList = {
+    'type': 'array',
+    'items': {
+	'type': 'object',
+	'properties': {
+	    'id':       { 'type': 'string', 'required': true },
+	    'username': { 'type': 'string', 'required': true }
+	}
+    }
+};
+
+var MmSchemaPostList = {
+    'type': 'object',
+    'properties': {
+	'order': {
+	    'type': 'array',
+	    'required': true,
+	    'items': { 'type': 'string' }
+	},
+	'posts': {
+	    'type': 'object',
+	    'required': true,
+	    'additionalProperties': {
+		'type': 'object',
+		'required': true,
+		'properties': {
+		    'user_id':   { 'type': 'string', 'required': true },
+	            'create_at': { 'type': 'number', 'required': true }
+		}
+	    }
+	}
+    }
+};
+
+function main()
+{
+	var parser, option, args, v;
+	var mmLogOptions;
+
+	mod_cmdutil.exitOnEpipe();
+	mod_cmdutil.configure({
+	    'usageMessage': 'view mattermost channel log files',
+	    'synopses': [
+	        '[FILTER_OPTIONS] CHANNEL_NAME'
+	    ]
+	});
+
+	/*
+	 * This object represents the parameters and runtime state for the
+	 * "mmlog" operation.
+	 */
+	mmLogOptions = {
+	    /* parameters */
+	    'mlo_apicfg': null,		/* server configuration object */
+	    'mlo_since': null,		/* "since" filter (Date object) */
+	    'mlo_channel_name': null,	/* requested channel name */
+
+	    /* runtime state */
+	    'mlo_users': null,		/* mapping of user ids to details */
+	    'mlo_channel_id': null,	/* discovered channel id */
+	    'mlo_team_id': null		/* discovered default team id */
+	};
+
+	parser = new mod_getopt.BasicParser(cliOptions.join(''), process.argv);
+	while ((option = parser.getopt()) !== undefined) {
+		switch (option.option) {
+		case 's':
+			v = mod_jsprim.parseDateTime(option.optarg);
+			if (isNaN(v.getTime())) {
+				mod_cmdutil.usage(
+				    'invalid option for -s/--since: %s',
+				    option.optarg);
+			}
+
+			mmLogOptions.mlo_since = v;
+			break;
+
+		default:
+			/* error message already emitted by getopt */
+			mod_assertplus.equal('?', option.option);
+			mod_cmdutil.usage();
+			break;
+		}
+	}
+
+	args = process.argv.slice(parser.optind());
+	if (args.length != 1) {
+		mod_cmdutil.usage();
+	}
+
+	mmLogOptions.mlo_channel_name = args[0];
+
+	/*
+	 * Finally configured, let's kick off the work.
+	 */
+	mod_vasync.pipeline({
+	    'arg': mmLogOptions,
+	    'funcs': [
+		mmlLoadConfig,
+		mmlGetUsers,
+		mmlGetTeamId,
+		mmlGetChannelId,
+		mmlGetPosts
+	    ]
+	}, function onDone(err) {
+		if (err) {
+			mod_cmdutil.fail(err);
+		}
+	});
+}
+
+/*
+ * Load the configuration from the user's .mmlogrc file.
+ */
+function mmlLoadConfig(mml, callback)
+{
+	config.mmLoadServerConfig(function onConfigLoaded(err, cfg) {
+		if (err) {
+			callback(new VError(err, 'loading configuration'));
+			return;
+		}
+
+		mml.mlo_apicfg = cfg;
+		callback();
+	});
+}
+
+/*
+ * Fetch the list of all users so that we can map user ids to human-readable
+ * names.
+ */
+function mmlGetUsers(mml, callback)
+{
+	mattermost.mmPaginatedList({
+	    'server': mml.mlo_apicfg,
+	    'method': 'GET',
+	    'resource': '/users'
+	}, function (err, users) {
+		if (err) {
+			callback(new VError(err, 'listing users'));
+			return;
+		}
+
+		err = mod_jsprim.validateJsonObject(MmSchemaUserList, users);
+		if (err) {
+			callback(new VError(err,
+			    'invalid user list from server'));
+			return;
+		}
+
+		mml.mlo_users = {};
+		users.forEach(function (u) {
+			mml.mlo_users[u.id] = {
+			    'u_id': u.id,
+			    'u_username': u.username,
+			    'u_nickname': u.nickname,
+			    'u_email': u.email,
+			    'u_firstname': u.first_name,
+			    'u_lastname': u.last_name
+			};
+		});
+
+		callback();
+	});
+}
+
+/*
+ * Fetch the id for the user's default team.
+ */
+function mmlGetTeamId(mml, callback)
+{
+	var teamname, resource;
+
+	teamname = mml.mlo_apicfg.mmc_default_team;
+	resource = mod_path.join('/teams/name', teamname);
+	mattermost.mmRequest({
+	    'server': mml.mlo_apicfg,
+	    'method': 'GET',
+	    'resource': resource
+	}, function (err, team) {
+		if (err) {
+			callback(new VError(err, 'finding team "%s"',
+			    teamname));
+			return;
+		}
+
+		if (typeof (team.id) != 'string') {
+			callback(new VError(err,
+			    'invalid response from server: team has no "id"'));
+			return;
+		}
+
+		mml.mlo_team_id = team.id;
+		callback();
+	});
+}
+
+/*
+ * Fetch the id for the requested channel.
+ */
+function mmlGetChannelId(mml, callback)
+{
+	var resource;
+
+	resource = mod_path.join('/teams', mml.mlo_team_id, 'channels',
+	    'name', mml.mlo_channel_name);
+	mattermost.mmRequest({
+	    'server': mml.mlo_apicfg,
+	    'method': 'GET',
+	    'resource': resource
+	}, function (err, channel) {
+		if (err) {
+			callback(new VError(err, 'listing channels'));
+			return;
+		}
+
+		if (typeof (channel.id) != 'string') {
+			callback(new VError(err, 'invalid response from ' +
+			    'server: channel has no "id"'));
+			return;
+		}
+
+		mml.mlo_channel_id = channel.id;
+		callback();
+	});
+}
+
+/*
+ * Finally, fetch posts from the specified channel.
+ */
+function mmlGetPosts(mml, callback)
+{
+	var resource, query;
+
+	resource = mod_path.join('/channels', mml.mlo_channel_id, 'posts');
+	query = {};
+
+	if (mml.mlo_since) {
+		query.since = mml.mlo_since.getTime();
+	}
+
+	mattermost.mmRequest({
+	    'server': mml.mlo_apicfg,
+	    'method': 'GET',
+	    'resource': resource,
+	    'query': query
+	}, function (err, posts) {
+		var i;
+
+		if (err) {
+			err = new VError(err, 'listing posts');
+			callback(err);
+			return;
+		}
+
+		err = mod_jsprim.validateJsonObject(
+		    MmSchemaPostList, posts);
+		if (!err) {
+			for (i = 0; i < posts.order.length; i++) {
+				if (!mod_jsprim.hasKey(posts.posts,
+				    posts.order[i])) {
+					callback(new VError(
+					    'invalid server response: ' +
+					    'contains post id "%s" with ' +
+					    'no associated post',
+					    posts.order[i]));
+					return;
+				}
+			}
+		}
+
+		if (err) {
+			callback(new VError(err,
+			    'invalid post list from server'));
+			return;
+		}
+
+		posts.order.reverse().forEach(function (postid) {
+			mmlFormatPost(mml, posts.posts[postid]);
+		});
+
+		callback();
+	});
+}
+
+/*
+ * Utility function to format a single post.
+ */
+function mmlFormatPost(mml, post)
+{
+	var uname, t;
+
+	if (mod_jsprim.hasKey(mml.mlo_users, post.user_id)) {
+		uname = mml.mlo_users[post.user_id].u_username;
+	} else {
+		uname = '(username unknown)';
+	}
+
+	t = new Date(post.create_at);
+	printf('%4d-%02d-%02d %02d:%02d:%02d.%03d %-21s  %s\n',
+	    t.getFullYear(),
+	    t.getMonth() + 1,
+	    t.getDate(),
+	    t.getHours(),
+	    t.getMinutes(),
+	    t.getSeconds(),
+	    t.getMilliseconds(),
+	    uname, post.message);
+}
+
+main();
